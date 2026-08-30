@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-import sqlite3
+import asyncpg
 from datetime import datetime, timedelta
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -14,39 +14,38 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 BOT_TOKEN = "8919520773:AAE64XexisrCiNY2QRgistWW8hQr5JR07Bg"
 ADMIN_ID = 5603202969
 ADMIN_USERNAME = "mz0401"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+db_pool = None
 
 # --- BAZA BILAN ISHLASH ---
-def db_start():
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS movies (
-            code TEXT PRIMARY KEY,
-            title TEXT,
-            file_id TEXT,
-            caption TEXT,
-            is_premium INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            joined_date TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            user_id INTEGER PRIMARY KEY,
-            expire_date TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-db_start()
+async def db_start():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS movies (
+                code TEXT PRIMARY KEY,
+                title TEXT,
+                file_id TEXT,
+                caption TEXT,
+                is_premium INTEGER DEFAULT 0
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                joined_date TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id BIGINT PRIMARY KEY,
+                expire_date TEXT
+            )
+        """)
 
 # --- FSM (Holatlar) ---
 class AddMovie(StatesGroup):
@@ -65,11 +64,11 @@ async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     now_date = datetime.now().isoformat()
     
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO users (user_id, joined_date) VALUES (?, ?)", (user_id, now_date))
-    conn.commit()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, joined_date) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
+            user_id, now_date
+        )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Premium sotib olish", callback_data="buy_premium")],
@@ -78,16 +77,13 @@ async def cmd_start(message: types.Message):
     await message.answer("Salom! 🎬 Kino kodini yuboring yoki quyidagi bo'limlardan foydalaning:", reply_markup=keyboard)
 
 # --- PROFIL VA OBUNANI TEKSHIRISH ---
-def check_user_premium(user_id: int) -> bool:
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT expire_date FROM subscriptions WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
-    conn.close()
+async def check_user_premium(user_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT expire_date FROM subscriptions WHERE user_id = $1", user_id)
     
-    if not res:
+    if not row:
         return False
-    expire_str = res[0]
+    expire_str = row['expire_date']
     if expire_str == "LIFETIME":
         return True
     
@@ -99,18 +95,16 @@ def check_user_premium(user_id: int) -> bool:
 @dp.callback_query(F.data == "my_profile")
 async def my_profile(call: types.CallbackQuery):
     user_id = call.from_user.id
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT expire_date FROM subscriptions WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT expire_date FROM subscriptions WHERE user_id = $1", user_id)
 
     status = "Oddiy ❌"
-    if res:
-        if res[0] == "LIFETIME":
+    if row:
+        expire_val = row['expire_date']
+        if expire_val == "LIFETIME":
             status = "Bir umrlik Premium ⭐ (Cheksiz)"
         else:
-            expire_date = datetime.fromisoformat(res[0])
+            expire_date = datetime.fromisoformat(expire_val)
             if datetime.now() < expire_date:
                 status = f"Premium ⭐ ({expire_date.strftime('%Y-%m-%d %H:%M')} gacha)"
             else:
@@ -142,21 +136,19 @@ async def back_start(call: types.CallbackQuery):
 @dp.callback_query(F.data == "buy_premium")
 async def buy_premium(call: types.CallbackQuery):
     user_id = call.from_user.id
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT expire_date FROM subscriptions WHERE user_id = ?", (user_id,))
-    res = cursor.fetchone()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT expire_date FROM subscriptions WHERE user_id = $1", user_id)
 
     has_active_sub = False
     sub_info = ""
 
-    if res:
-        if res[0] == "LIFETIME":
+    if row:
+        expire_val = row['expire_date']
+        if expire_val == "LIFETIME":
             has_active_sub = True
             sub_info = "Sizda **Bir umrlik (Lifetime) Premium** obuna mavjud ⭐"
         else:
-            expire_date = datetime.fromisoformat(res[0])
+            expire_date = datetime.fromisoformat(expire_val)
             if datetime.now() < expire_date:
                 has_active_sub = True
                 sub_info = f"Sizda faol Premium obuna mavjud ⭐\n📅 Tugash vaqti: **{expire_date.strftime('%Y-%m-%d %H:%M')}**"
@@ -198,14 +190,11 @@ async def cmd_admin(message: types.Message):
 
 @dp.callback_query(F.data == "admin_stat", F.from_user.id == ADMIN_ID)
 async def admin_stat(call: types.CallbackQuery):
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT COUNT(*) FROM users")
-    users_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT joined_date FROM users")
-    all_users = cursor.fetchall()
+    async with db_pool.acquire() as conn:
+        users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        all_users = await conn.fetch("SELECT joined_date FROM users")
+        movies_count = await conn.fetchval("SELECT COUNT(*) FROM movies")
+        prem_movies = await conn.fetchval("SELECT COUNT(*) FROM movies WHERE is_premium = 1")
     
     now = datetime.now()
     today_count = 0
@@ -213,9 +202,10 @@ async def admin_stat(call: types.CallbackQuery):
     month_count = 0
     
     for u in all_users:
-        if u[0]:
+        date_str = u['joined_date']
+        if date_str:
             try:
-                j_date = datetime.fromisoformat(u[0])
+                j_date = datetime.fromisoformat(date_str)
                 if j_date.date() == now.date():
                     today_count += 1
                 if now - j_date <= timedelta(days=7):
@@ -224,12 +214,6 @@ async def admin_stat(call: types.CallbackQuery):
                     month_count += 1
             except Exception:
                 pass
-
-    cursor.execute("SELECT COUNT(*) FROM movies")
-    movies_count = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM movies WHERE is_premium = 1")
-    prem_movies = cursor.fetchone()[0]
-    conn.close()
 
     await call.message.answer(
         f"📊 **Bot statistikasi:**\n\n"
@@ -265,18 +249,17 @@ async def give_subscription(message: types.Message):
     target_id = int(args[1])
     duration = args[2]
     
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    
     if duration.lower() == "lifetime":
         expire_val = "LIFETIME"
     else:
         days = int(duration)
         expire_val = (datetime.now() + timedelta(days=days)).isoformat()
         
-    cursor.execute("INSERT OR REPLACE INTO subscriptions (user_id, expire_date) VALUES (?, ?)", (target_id, expire_val))
-    conn.commit()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO subscriptions (user_id, expire_date) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET expire_date = $2",
+            target_id, expire_val
+        )
     
     await message.answer(f"✅ `{target_id}` ID egasiga muvaffaqiyatli Premium berildi!", parse_mode="Markdown")
     try:
@@ -322,14 +305,13 @@ async def process_file(message: types.Message, state: FSMContext):
 async def process_caption(message: types.Message, state: FSMContext):
     data = await state.get_data()
     
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO movies (code, title, file_id, caption, is_premium) VALUES (?, ?, ?, ?, ?)",
-        (data['code'], data['title'], data['file_id'], message.text, data['is_premium'])
-    )
-    conn.commit()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO movies (code, title, file_id, caption, is_premium) 
+               VALUES ($1, $2, $3, $4, $5) 
+               ON CONFLICT (code) DO UPDATE SET title = $2, file_id = $3, caption = $4, is_premium = $5""",
+            data['code'], data['title'], data['file_id'], message.text, data['is_premium']
+        )
     
     await state.clear()
     prem_text = "⭐ Premium kino" if data['is_premium'] == 1 else "🟢 Oddiy kino"
@@ -344,17 +326,14 @@ async def broadcast_start(call: types.CallbackQuery, state: FSMContext):
 @dp.message(Broadcast.text, F.from_user.id == ADMIN_ID)
 async def broadcast_send(message: types.Message, state: FSMContext):
     await state.clear()
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT user_id FROM users")
 
     sent = 0
     failed = 0
     for user in users:
         try:
-            await message.send_copy(chat_id=user[0])
+            await message.send_copy(chat_id=user['user_id'])
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -371,16 +350,16 @@ async def get_movie(message: types.Message):
     user_id = message.from_user.id
     code = message.text.strip()
     
-    conn = sqlite3.connect("kino_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT title, file_id, caption, is_premium FROM movies WHERE code = ?", (code,))
-    movie = cursor.fetchone()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        movie = await conn.fetchrow("SELECT title, file_id, caption, is_premium FROM movies WHERE code = $1", code)
 
     if movie:
-        title, file_id, caption, is_premium = movie
+        title = movie['title']
+        file_id = movie['file_id']
+        caption = movie['caption'] or ""
+        is_premium = movie['is_premium']
         
-        if is_premium == 1 and not check_user_premium(user_id):
+        if is_premium == 1 and not await check_user_premium(user_id):
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⭐ Premium sotib olish", callback_data="buy_premium")]
             ])
@@ -392,7 +371,6 @@ async def get_movie(message: types.Message):
             )
             return
 
-        # Xatolikka sabab bo'lgan .username olib tashlandi
         text = f"🎬 <b>{title}</b>\n\n{caption}"
         await message.answer_video(video=file_id, caption=text, parse_mode="HTML")
     else:
@@ -414,7 +392,8 @@ async def web_server():
 # --- MAIN ---
 async def main():
     logging.basicConfig(level=logging.INFO)
-    print("Bot ishga tushdi...")
+    await db_start()
+    print("Bot ishga tushdi va Supabase bazasiga ulandi...")
     await web_server()
     await dp.start_polling(bot)
 
