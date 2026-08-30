@@ -365,7 +365,6 @@ async def broadcast_send(message: types.Message, state: FSMContext):
 # --- KINO QIDIRISH (ASOSIY QISM) ---
 @dp.message(F.text)
 async def get_movie(message: types.Message):
-    # Agar xabar / bilan boshlansa yoki admin buyruqlariga tegishli bo'lsa, uni o'tkazib yuboramiz
     if message.text.startswith("/"):
         return
 
@@ -393,7 +392,8 @@ async def get_movie(message: types.Message):
             )
             return
 
-        text = f"🎬 <b>{title}</b>\n\n{caption}\n\n🤖 Bot: @{message.bot.username}"
+        # Xatolikka sabab bo'lgan .username olib tashlandi
+        text = f"🎬 <b>{title}</b>\n\n{caption}"
         await message.answer_video(video=file_id, caption=text, parse_mode="HTML")
     else:
         await message.answer("❌ Bunday kodli kino topilmadiku brat. Kodni tekshirib qaytadan yubor.")
