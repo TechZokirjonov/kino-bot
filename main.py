@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import re
 import asyncpg
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -267,79 +268,32 @@ async def give_subscription(message: types.Message):
     except Exception:
         pass
 
-# --- KINO QO'SHISH ---
-@dp.callback_query(F.data == "admin_add", F.from_user.id == ADMIN_ID)
-async def admin_add_start(call: types.CallbackQuery, state: FSMContext):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟢 Oddiy kino", callback_data="type_0")],
-        [InlineKeyboardButton(text="⭐ Premium kino", callback_data="type_1")]
-    ])
-    await call.message.answer("Kino turini tanlang:", reply_markup=keyboard)
-
-@dp.callback_query(F.data.startswith("type_"), F.from_user.id == ADMIN_ID)
-async def process_movie_type(call: types.CallbackQuery, state: FSMContext):
-    is_prem = int(call.data.split("_")[1])
-    await state.update_data(is_premium=is_prem)
-    await state.set_state(AddMovie.code)
-    await call.message.edit_text("🎬 Kino uchun kod kiriting (masalan: 101):")
-
-@dp.message(AddMovie.code, F.from_user.id == ADMIN_ID)
-async def process_code(message: types.Message, state: FSMContext):
-    await state.update_data(code=message.text.strip())
-    await state.set_state(AddMovie.title)
-    await message.answer("Kino nomini kiriting:")
-
-@dp.message(AddMovie.title, F.from_user.id == ADMIN_ID)
-async def process_title(message: types.Message, state: FSMContext):
-    await state.update_data(title=message.text)
-    await state.set_state(AddMovie.file_id)
-    await message.answer("Kinoning video faylini (yoki videoxabarni) yuboring:")
-
-@dp.message(AddMovie.file_id, F.video, F.from_user.id == ADMIN_ID)
-async def process_file(message: types.Message, state: FSMContext):
-    await state.update_data(file_id=message.video.file_id)
-    await state.set_state(AddMovie.caption)
-    await message.answer("Kino haqida izoh (matn) yuboring:")
-
-@dp.message(AddMovie.caption, F.from_user.id == ADMIN_ID)
-async def process_caption(message: types.Message, state: FSMContext):
-    data = await state.get_data()
+# --- KANALGA TASHLANGAN KINOLARNI AVTO-QO'SHISH (PARSER) ---
+@dp.channel_post(F.video)
+async def auto_add_movie_from_channel(message: types.Message):
+    caption = message.caption or ""
     
+    # Kodni qidirib topish (masalan: Kod: 105)
+    code_match = re.search(r"Kod:\s*([a-zA-Z0-9]+)", caption, re.IGNORECASE)
+    if not code_match:
+        return
+    
+    code = code_match.group(1).strip()
+    file_id = message.video.file_id
+    
+    # Kinoning nomini olish (birinchi qatordan "🎬 " ni olib tashlab)
+    lines = caption.split("\n")
+    title = lines[0].replace("🎬", "").strip() if lines else "Kino"
+    
+    # Bazaga saqlash
     async with db_pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO movies (code, title, file_id, caption, is_premium) 
                VALUES ($1, $2, $3, $4, $5) 
-               ON CONFLICT (code) DO UPDATE SET title = $2, file_id = $3, caption = $4, is_premium = $5""",
-            data['code'], data['title'], data['file_id'], message.text, data['is_premium']
+               ON CONFLICT (code) DO UPDATE SET title = $2, file_id = $3, caption = $4""",
+            code, title, file_id, caption, 0
         )
-    
-    await state.clear()
-    prem_text = "⭐ Premium kino" if data['is_premium'] == 1 else "🟢 Oddiy kino"
-    await message.answer(f"✅ {prem_text} muvaffaqiyatli saqlandi! Kod: `{data['code']}`", parse_mode="Markdown")
-
-# --- REKLAMA TARQATISH ---
-@dp.callback_query(F.data == "admin_broadcast", F.from_user.id == ADMIN_ID)
-async def broadcast_start(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(Broadcast.text)
-    await call.message.answer("Barcha foydalanuvchilarga yubormoqchi bo'lgan xabaringizni yuboring:")
-
-@dp.message(Broadcast.text, F.from_user.id == ADMIN_ID)
-async def broadcast_send(message: types.Message, state: FSMContext):
-    await state.clear()
-    async with db_pool.acquire() as conn:
-        users = await conn.fetch("SELECT user_id FROM users")
-
-    sent = 0
-    failed = 0
-    for user in users:
-        try:
-            await message.send_copy(chat_id=user['user_id'])
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-
-    await message.answer(f"📢 Reklama tarqatildi:\n\n✅ Yetib bordi: {sent}\n❌ Bloklaganlar: {failed}")
+    print(f"Avtomatik qo'shildi -> Kod: {code}, Nomi: {title}")
 
 # --- KINO QIDIRISH (ASOSIY QISM) ---
 @dp.message(F.text)
